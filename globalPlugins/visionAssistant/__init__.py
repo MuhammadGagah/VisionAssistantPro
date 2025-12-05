@@ -35,7 +35,7 @@ MODELS = [
 ]
 
 BASE_LANGUAGES = [
-    ("Arabic", "ar"), ("Chinese", "zh"), ("Czech", "cs"), ("Danish", "da"),
+    ("Arabic", "ar"), ("Bulgarian", "bg"), ("Chinese", "zh"), ("Czech", "cs"), ("Danish", "da"),
     ("Dutch", "nl"), ("English", "en"), ("Finnish", "fi"), ("French", "fr"),
     ("German", "de"), ("Greek", "el"), ("Hebrew", "he"), ("Hindi", "hi"),
     ("Hungarian", "hu"), ("Indonesian", "id"), ("Italian", "it"), ("Japanese", "ja"),
@@ -280,15 +280,15 @@ class VisionQADialog(wx.Dialog):
         threading.Thread(target=self.process_question, args=(question,), daemon=True).start()
 
     def process_question(self, question):
-        response_text, _ = self.callback_fn(self.context_data, question, self.chat_history, self.extra_info)
-        clean_resp = clean_markdown(response_text)
+        result_tuple = self.callback_fn(self.context_data, question, self.chat_history, self.extra_info)
+        response_text, _ = result_tuple
         
         if response_text:
+            clean_resp = clean_markdown(response_text)
             if not (self.extra_info and self.extra_info.get('file_context')):
                  self.chat_history.append({"role": "user", "parts": [{"text": question}]})
                  self.chat_history.append({"role": "model", "parts": [{"text": response_text}]})
-            
-        wx.CallAfter(self.update_response, clean_resp)
+            wx.CallAfter(self.update_response, clean_resp)
 
     def update_response(self, text):
         # Translators: Format for displaying AI message
@@ -475,11 +475,18 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 if response.status == 200:
                     res_json = json.loads(response.read().decode('utf-8'))
                     return res_json.get('file', {}).get('uri')
+        except error.URLError as e:
+            # Translators: Connection error during upload
+            msg = _("Upload Connection Error: {reason}").format(reason=e.reason)
+            show_error_dialog(msg)
+        except error.HTTPError as e:
+            # Translators: HTTP error during upload
+            msg = _("Upload Server Error {code}: {reason}").format(code=e.code, reason=e.reason)
+            show_error_dialog(msg)
         except Exception as e:
-            # Translators: Error during file upload
+            # Translators: Generic upload error
             msg = _("File Upload Error: {error}").format(error=e)
             show_error_dialog(msg)
-            return None
         return None
 
     def _call_gemini(self, prompt_or_contents, attachments=[], json_mode=False, raise_errors=False):
@@ -543,6 +550,33 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 return None
         return None
 
+    def _call_gemini_safe(self, *args, **kwargs):
+        try:
+            return self._call_gemini(*args, raise_errors=True, **kwargs)
+        except error.URLError as e:
+            # Translators: Connection error with technical reason
+            msg = _("Connection Error: {reason}").format(reason=e.reason)
+            show_error_dialog(msg)
+        except error.HTTPError as e:
+            if e.code == 400:
+                # Translators: HTTP 400
+                msg = _("Error 400: Bad Request (Check API Key Format)")
+            elif e.code == 403:
+                # Translators: HTTP 403
+                msg = _("Error 403: Forbidden (Check Region/Permission)")
+            elif e.code == 429:
+                # Translators: HTTP 429
+                msg = _("Error 429: Quota Exceeded (Try later)")
+            else:
+                # Translators: Generic HTTP error
+                msg = _("Server Error {code}: {reason}").format(code=e.code, reason=e.reason)
+            show_error_dialog(msg)
+        except Exception as e:
+            # Translators: Generic fallback error
+            msg = _("Error: {error}").format(error=e)
+            show_error_dialog(msg)
+        return None
+
     # Translators: Script description for Input Gestures
     @scriptHandler.script(description=_("Records voice, transcribes it using AI, and types the result."))
     def script_smartDictation(self, gesture):
@@ -583,33 +617,19 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             
             p = "Transcribe speech. Use native script. No Fingilish. Fix stutters."
             
-            try:
-                res = self._call_gemini(p, attachments=[{'mime_type': 'audio/wav', 'data': audio_data}], raise_errors=True)
-                if res: wx.CallAfter(self._paste_text, res)
-                # Translators: Message when no speech is recognized
-                else: 
-                    msg = _("No speech recognized.")
-                    wx.CallAfter(ui.message, msg)
-            except error.HTTPError as e:
-                 # Translators: Server error details
-                 msg = _("Server Error: {code} {reason}").format(code=e.code, reason=e.reason)
-                 show_error_dialog(msg)
-            except Exception as e:
-                 # Translators: Generic connection error
-                 msg = _("Connection Error: {error}").format(error=e)
-                 show_error_dialog(msg)
+            res = self._call_gemini_safe(p, attachments=[{'mime_type': 'audio/wav', 'data': audio_data}])
+            if res: wx.CallAfter(self._paste_text, res)
+            else: 
+                msg = _("No speech recognized or Error.")
+                wx.CallAfter(ui.message, msg)
             
             try: os.remove(self.temp_audio_file)
             except: pass
-        except: 
-            # Translators: Dictation failure
-            msg = _("Critical Dictation Failure.")
-            show_error_dialog(msg)
+        except: pass
 
     def _paste_text(self, text):
         api.copyToClip(text)
         send_ctrl_v()
-        # Announce after a short delay to avoid interruption
         wx.CallLater(300, self._announce_paste, text)
 
     def _announce_paste(self, text):
@@ -652,16 +672,12 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             smart_swap=str(swap),
             text_content=safe_text
         )
-        res = self._call_gemini(p)
+        res = self._call_gemini_safe(p)
         if res:
             self._last_source_text = text
             self._last_params = current_params
             self.last_translation = res
             wx.CallAfter(self._announce_translation, res)
-        # Translators: Error message for failed translation
-        else: 
-            msg = _("Translation failed. Check your API Key or Internet.")
-            show_error_dialog(msg)
 
     def _announce_translation(self, text):
         api.copyToClip(text)
@@ -758,7 +774,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 fd = wx.FileDialog(gui.mainFrame, title, wildcard=wc, style=wx.FD_OPEN)
                 if fd.ShowModal() == wx.ID_OK:
                     file_path = fd.GetPath()
-                    # Delay starting the thread to allow focus speech to finish
                     wx.CallLater(500, lambda: threading.Thread(target=self._thread_refine, args=(text, custom_content, file_path), daemon=True).start())
                 fd.Destroy()
             else:
@@ -815,7 +830,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                     file_uri = self._upload_file_to_gemini(file_path, mime_type)
                     if file_uri:
                          attachments.append({'mime_type': mime_type, 'file_uri': file_uri})
-                         # Keep prompt if user added specific instructions, else default
                          prompt_text = prompt_text.replace("[file_ocr]", "")
                          if not prompt_text.strip():
                              prompt_text = "Extract all text from this file as plain text. Do not use JSON or bounding boxes."
@@ -843,7 +857,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         # Translators: Message while processing request
         msg = _("Analyzing...")
         wx.CallAfter(ui.message, msg)
-        res = self._call_gemini(prompt_text, attachments=attachments)
+        res = self._call_gemini_safe(prompt_text, attachments=attachments)
         
         if res:
              wx.CallAfter(self._open_refine_result_dialog, res, attachments, text)
@@ -856,18 +870,15 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             
             messages = []
             
-            # Check for file context
             has_file = any('file_uri' in a for a in atts)
             
             if not history:
                 if has_file:
-                     # Re-send file context for the first turn of chat
                      sys_parts = [{"text": f"Context: File attached. Task: Answer questions."}]
                      for att in atts:
                         if 'file_uri' in att:
                              sys_parts.append({"file_data": {"mime_type": att['mime_type'], "file_uri": att['file_uri']}})
                 else:
-                     # For text/image data
                      context_msg = f"Context Text: {orig}\n\nTask: Answer questions."
                      sys_parts = [{"text": context_msg}]
                      for att in atts:
@@ -880,7 +891,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 messages.extend(history)
             
             messages.append(current_user_msg)
-            return self._call_gemini(messages), None
+            return self._call_gemini_safe(messages), None
 
         context = (attachments, original_text)
         has_file_context = any('file_uri' in a for a in attachments)
@@ -905,29 +916,21 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         dlg.Destroy()
 
     def _process_file_ocr(self, path):
-        try:
-            # Translators: Message while uploading file
-            msg = _("Uploading & Extracting...")
-            wx.CallAfter(ui.message, msg)
-            mime_type = get_mime_type(path)
+        # Translators: Message while uploading file
+        msg = _("Uploading & Extracting...")
+        wx.CallAfter(ui.message, msg)
+        mime_type = get_mime_type(path)
+        
+        file_uri = self._upload_file_to_gemini(path, mime_type)
+        
+        if file_uri:
+            att = [{'mime_type': mime_type, 'file_uri': file_uri}]
             
-            file_uri = self._upload_file_to_gemini(path, mime_type)
-            
-            if file_uri:
-                att = [{'mime_type': mime_type, 'file_uri': file_uri}]
-                
-                # Default command for fileOCR is extraction
-                res = self._call_gemini("Extract all text from this file as plain text. Do not use JSON or bounding boxes.", attachments=att)
-                if res:
-                    # Reuse Document Chat dialog for consistency
-                    wx.CallAfter(self._open_doc_chat_dialog, res, att, "")
-            else:
-                # Translators: Error if file upload fails
-                show_error_dialog(_("File upload failed."))
-                
-        except: 
-            # Translators: Generic document error
-            show_error_dialog(_("Error processing file."))
+            res = self._call_gemini_safe("Extract all text from this file as plain text. Do not use JSON or bounding boxes.", attachments=att)
+            if res:
+                wx.CallAfter(self._open_doc_chat_dialog, res, att, "")
+        else:
+            pass
 
     # Translators: Script description for Input Gestures
     @scriptHandler.script(description=_("Allows asking questions about a selected document (PDF/Text/Image)."))
@@ -946,27 +949,21 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         dlg.Destroy()
 
     def _process_doc_file(self, path):
-        try:
-            # Translators: Message while uploading file
-            msg = _("Uploading & Analyzing...")
-            wx.CallAfter(ui.message, msg)
-            mime_type = get_mime_type(path)
+        # Translators: Message while uploading file
+        msg = _("Uploading & Analyzing...")
+        wx.CallAfter(ui.message, msg)
+        mime_type = get_mime_type(path)
+        
+        file_uri = self._upload_file_to_gemini(path, mime_type)
+        
+        if file_uri:
+            att = [{'mime_type': mime_type, 'file_uri': file_uri}]
+            # Translators: Initial message in document chat
+            init_msg = _("Document ready. Ask your question.")
             
-            file_uri = self._upload_file_to_gemini(path, mime_type)
-            
-            if file_uri:
-                att = [{'mime_type': mime_type, 'file_uri': file_uri}]
-                # Translators: Initial message in document chat
-                init_msg = _("Document ready. Ask your question.")
-                
-                wx.CallAfter(self._open_doc_chat_dialog, init_msg, att, "")
-            else:
-                # Translators: Error if file upload fails
-                show_error_dialog(_("File upload failed."))
-                
-        except: 
-            # Translators: Generic document error
-            show_error_dialog(_("Error processing document."))
+            wx.CallAfter(self._open_doc_chat_dialog, init_msg, att, "")
+        else:
+            pass
         
     def _open_doc_chat_dialog(self, init_msg, initial_attachments, doc_text):
         def doc_callback(ctx_atts, q, history, dum2):
@@ -977,17 +974,16 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             
             messages = []
             if not history:
-                # First user turn with file
                 parts = [{"text": f"Analyze this file. {q} (Respond in {lang})"}]
                 for att in atts:
                     if 'file_uri' in att:
                         parts.append({"file_data": {"mime_type": att['mime_type'], "file_uri": att['file_uri']}})
                 
-                return self._call_gemini([{"parts": parts}]), None
+                return self._call_gemini_safe([{"parts": parts}]), None
             else:
                 messages.extend(history)
                 messages.append(current_user_msg)
-                return self._call_gemini(messages), None
+                return self._call_gemini_safe(messages), None
             
         # Translators: Dialog title for Chat
         dlg = VisionQADialog(gui.mainFrame, _("Vision Assistant - Chat"), init_msg, initial_attachments, doc_callback, extra_info={'skip_init_history': True})
@@ -1010,7 +1006,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             # Translators: Message while scanning screen
             msg = _("Scanning...")
             ui.message(msg)
-            # Wait a bit for message to be spoken before heavy task
             wx.CallLater(100, lambda: threading.Thread(target=self._thread_vision, args=(d, w, h), daemon=True).start())
         else: 
             # Translators: Message when capture fails
@@ -1020,12 +1015,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         lang = config.conf["VisionAssistant"]["ai_response_language"]
         p = f"Analyze this image and describe it. Language: {lang}. Ensure the response is strictly in {lang}."
         att = [{'mime_type': 'image/png', 'data': img}]
-        res = self._call_gemini(p, attachments=att)
+        res = self._call_gemini_safe(p, attachments=att)
         if res:
             wx.CallAfter(self._open_vision_dialog, res, att, None)
-        else:
-            # Translators: Vision analysis failed
-            show_error_dialog(_("Vision analysis failed."))
         
     def _open_vision_dialog(self, text, atts, size):
         def cb(atts, q, history, sz):
@@ -1043,7 +1035,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 messages.extend(history)
                 
             messages.append(current_user_msg)
-            return self._call_gemini(messages), None
+            return self._call_gemini_safe(messages), None
             
         # Translators: Dialog title for Image Analysis
         dlg = VisionQADialog(gui.mainFrame, _("Vision Assistant - Image Analysis"), text, atts, cb, None)
@@ -1065,33 +1057,26 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         dlg.Destroy()
 
     def _thread_audio(self, path):
-        try:
-            # Translators: Message while uploading audio
-            msg = _("Uploading...")
-            wx.CallAfter(ui.message, msg)
-            mime_type = get_mime_type(path)
-            
-            file_uri = self._upload_file_to_gemini(path, mime_type)
-            if not file_uri: return
+        # Translators: Message while uploading audio
+        msg = _("Uploading...")
+        wx.CallAfter(ui.message, msg)
+        mime_type = get_mime_type(path)
+        
+        file_uri = self._upload_file_to_gemini(path, mime_type)
+        if not file_uri: return
 
-            # Translators: Message while analyzing audio
-            msg = _("Analyzing...")
-            wx.CallAfter(ui.message, msg)
-            lang = config.conf["VisionAssistant"]["ai_response_language"]
-            p = f"Transcribe this audio in {lang}."
-            
-            att = [{'mime_type': mime_type, 'file_uri': file_uri}]
-            res = self._call_gemini(p, attachments=att)
-            
-            if res:
-                # Use open_doc_chat_dialog to enable follow-up questions on audio
-                # Translators: Initial message for Audio Chat
-                init_msg = res 
-                wx.CallAfter(self._open_doc_chat_dialog, init_msg, att, "")
-            else:
-                # Translators: Transcription failed message
-                show_error_dialog(_("Transcription failed."))
-        except: show_error_dialog(_("Audio processing error."))
+        # Translators: Message while analyzing audio
+        msg = _("Analyzing...")
+        wx.CallAfter(ui.message, msg)
+        lang = config.conf["VisionAssistant"]["ai_response_language"]
+        p = f"Transcribe this audio in {lang}."
+        
+        att = [{'mime_type': mime_type, 'file_uri': file_uri}]
+        res = self._call_gemini_safe(p, attachments=att)
+        
+        if res:
+            init_msg = res 
+            wx.CallAfter(self._open_doc_chat_dialog, init_msg, att, "")
 
     # Translators: Script description for Input Gestures
     @scriptHandler.script(description=_("Attempts to solve a CAPTCHA on the screen or navigator object."))
@@ -1120,7 +1105,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if is_gov: p += " Read 5 Persian digits, convert to English."
         else: p += " Convert to English digits."
         
-        r = self._call_gemini(p, attachments=[{'mime_type': 'image/png', 'data': d}])
+        r = self._call_gemini_safe(p, attachments=[{'mime_type': 'image/png', 'data': d}])
         if r: wx.CallAfter(self._finish_captcha, r)
         else: wx.CallAfter(ui.message, _("Failed."))
 
